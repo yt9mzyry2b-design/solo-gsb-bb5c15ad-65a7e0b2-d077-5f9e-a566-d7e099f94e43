@@ -10,6 +10,12 @@ POST /commit   submit a nested JSON document plus the RFC 6901 paths that
 POST /verify   check disclosures against a previously committed root without
                ever seeing the original document; both proof formats are
                detected automatically.
+POST /gate/evaluate
+               verify a disclosure exactly like /verify (standard or compact
+               proof, same errors), then evaluate a policy of all/any groups
+               and {path, op, value} leaf conditions over the verified values
+               with three-valued logic, returning pass/fail/unknown plus one
+               result per condition.
 POST /diff     compare two documents at their RFC 6901 leaf paths and report
                added, removed and changed canonical values.
 POST /patch    apply an ordered list of RFC 6902 operations (add, remove,
@@ -48,6 +54,7 @@ from fastapi.responses import JSONResponse
 from . import pointers
 from .canonical import CanonicalError
 from .diff import diff_documents
+from .gate import evaluate_policy, parse_policy
 from .merge import merge_documents
 from .patch import apply_patch
 from .redact import redact_document
@@ -98,7 +105,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -965,16 +972,15 @@ def _verify_compact(
     return verified
 
 
-@app.post("/verify")
-async def verify(request: Request) -> Dict[str, Any]:
-    body = await _read_json_body(request)
-    if not isinstance(body, dict):
-        raise ApiError(
-            INVALID_REQUEST,
-            "request body must be a JSON object",
-            loc="body",
-        )
+def _verify_request(body: Dict[str, Any]) -> Tuple[bytes, str, List[Dict[str, Any]]]:
+    """Run the exact /verify verification pipeline on a parsed request body.
 
+    Returns ``(expected_root, proof_mode, verified_leaves)`` where
+    *proof_mode* is ``"standard"`` or ``"compact"`` and *verified_leaves*
+    are the path-sorted ``{"path", "value"}`` disclosures.  Both proof
+    formats are auto-detected; every structural or cryptographic failure
+    raises the same :class:`ApiError` /verify would return.
+    """
     expected_root = _parse_hex32(
         _get_field(body, "root", "root"), "root", "root hash"
     )
@@ -984,13 +990,7 @@ async def verify(request: Request) -> Dict[str, Any]:
     # the legacy shape carries per-leaf "proof" arrays.
     is_compact = "proofNodes" in body or "leafCount" in body
     if is_compact:
-        verified = _verify_compact(body, expected_root)
-        return {
-            "valid": True,
-            "root": expected_root.hex(),
-            "proofMode": "compact",
-            "leaves": verified,
-        }
+        return expected_root, "compact", _verify_compact(body, expected_root)
 
     raw_leaves = _get_field(body, "leaves", "leaves")
     if not isinstance(raw_leaves, list):
@@ -1077,7 +1077,61 @@ async def verify(request: Request) -> Dict[str, Any]:
         verified.append({"path": path, "value": value})
 
     verified.sort(key=lambda item: item["path"])
-    return {"valid": True, "root": expected_root.hex(), "leaves": verified}
+    return expected_root, "standard", verified
+
+
+@app.post("/verify")
+async def verify(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    expected_root, proof_mode, verified = _verify_request(body)
+    response: Dict[str, Any] = {"valid": True, "root": expected_root.hex()}
+    if proof_mode == "compact":
+        response["proofMode"] = "compact"
+    response["leaves"] = verified
+    return response
+
+
+# ---------------------------------------------------------------------------
+# POST /gate/evaluate
+# ---------------------------------------------------------------------------
+
+
+@app.post("/gate/evaluate")
+async def gate_evaluate(request: Request) -> Dict[str, Any]:
+    body = await _read_json_body(request)
+    if not isinstance(body, dict):
+        raise ApiError(
+            INVALID_REQUEST,
+            "request body must be a JSON object",
+            loc="body",
+        )
+
+    # 1. Verify the whole disclosure proof with the exact /verify rules;
+    #    an invalid proof fails here with the /verify error unchanged.
+    expected_root, proof_mode, verified = _verify_request(body)
+
+    # 2. Validate the policy tree; every structural error carries a loc
+    #    inside "policy" (empty groups and malformed conditions included).
+    policy = parse_policy(_get_field(body, "policy", "policy"))
+
+    # 3. Evaluate against the verified leaf values only — the gate never
+    #    sees the original document, so undisclosed paths are "unknown".
+    values_by_path = {leaf["path"]: leaf["value"] for leaf in verified}
+    result, conditions = evaluate_policy(policy, values_by_path)
+
+    response: Dict[str, Any] = {"valid": True, "root": expected_root.hex()}
+    if proof_mode == "compact":
+        response["proofMode"] = "compact"
+    response["result"] = result
+    response["conditions"] = conditions
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1094,10 +1148,11 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
+            "gateEvaluate": "POST /gate/evaluate",
             "diff": "POST /diff",
             "patch": "POST /patch",
             "patchUndo": "POST /patch/undo",

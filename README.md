@@ -486,6 +486,59 @@ array       0x17 || u32be(元素数) || 子节点哈希*                  （保
 （`NaN`/`Infinity` 返回 `UNSUPPORTED_VALUE`，`loc` 指向 `base`/`left`/`right`）；
 缺字段返回 `INVALID_REQUEST`，`loc` 指向对应字段。
 
+### 12. 策略门控评估（`POST /gate/evaluate`）
+
+`/gate/evaluate` 把「无原文校验」与「策略判定」合成一步：请求体是 **`/verify` 的请求
+（标准或紧凑证明，自动识别）外加一棵 `policy`**。服务先按 `/verify` 的原规则验证整份
+证明——证明无效时返回与 `/verify` **完全相同的错误**（`400 BAD_PROOF`、
+`422 ROOT_MISMATCH` 等，`loc` 不变）；证明有效后，再**只根据已验证的披露叶**评估策略，
+服务自始至终接触不到原始文档。
+
+**policy** 是由 `all` / `any` 嵌套组与叶条件组成的树：
+
+- 组节点：`{"all": [<子节点>…]}` 或 `{"any": [<子节点>…]}`，子节点数组**不能为空**，
+  一个节点只能携带一个组合子，且不能同时携带条件字段；
+- 叶条件：`{"path": "<RFC 6901 叶路径>", "op": "eq"|"gte", "value": <常量>}`；
+- `policy` 本身可以就是一个叶条件（不包组）。
+
+条件语义：
+
+- `path` 是**精确**的 RFC 6901 叶路径（不做通配）；该路径未被披露时条件记 `unknown`；
+- `eq` 按**规范 JSON 字节**比较披露值与常量（与叶哈希同一套规范形式：`1` 与 `1.0`
+  不等、`true` 与 `1` 不等、对象键序无关）；
+- `gte` 做数值比较，阈值 `value` **必须是非布尔的有限数字**（布尔、字符串、`null`、
+  容器一律 `400 INVALID_REQUEST`，`loc` 指向 `policy….value`）；**披露值不是非布尔
+  数字时条件判 `fail`**（不是 `unknown`）。
+
+三值逻辑：`all` 中任一子节点 `fail` 即 `fail`（false 优先），否则有 `unknown` 记
+`unknown`，全 `pass` 才 `pass`；`any` 中任一子节点 `pass` 即 `pass`（true 优先），
+否则有 `unknown` 记 `unknown`，全 `fail` 才 `fail`。
+
+成功响应（`200`）：
+
+```json
+{
+  "valid": true,
+  "root": "cf34…（64 位十六进制）",
+  "result": "pass",
+  "conditions": [
+    {"loc": "policy.all[0]", "path": "/subject/age", "op": "gte", "value": 18, "result": "pass"},
+    {"loc": "policy.all[1].any[0]", "path": "/subject/name", "op": "eq", "value": "Ada Lovelace", "result": "pass"}
+  ]
+}
+```
+
+- `result`：整棵策略树折出的总判定 `pass` / `fail` / `unknown`；
+- `conditions`：每个叶条件一条结果，按策略**先序遍历顺序**排列，`loc` 指回该条件在
+  所提交 `policy` 中的位置；
+- 紧凑证明的响应同样多一个 `"proofMode": "compact"`。
+
+策略结构错误一律 `400`，`loc` 定位到 `policy` 内的出错位置：空组
+（`policy.all`、`policy.all[1].any`）、组同时携带 `all` 与 `any` 或混入条件字段
+（`policy`）、子节点不是数组/对象、条件缺字段或 `op` 非法（`policy.op`）、
+`path` 非字符串或指针语法错误（`POINTER_SYNTAX`，`policy.any[0].path`）、
+`gte` 阈值非法（`policy.value`）等。
+
 ## API
 
 所有请求/响应均为 JSON。错误响应统一形如：
@@ -813,6 +866,51 @@ curl -s localhost:8000/patch/undo -H 'content-type: application/json' -d '{
 } }
 ```
 
+### `POST /gate/evaluate` — 验证披露并评估策略门控
+
+请求体 = `/verify` 请求（标准或紧凑证明，自动识别）+ `policy` 策略树。先按 `/verify`
+原规则验证整份证明（失败时沿用其错误与 `loc`），再只用已验证的披露叶评估策略：
+
+```json
+{
+  "root": "9f0c…",
+  "leaves": [
+    { "path": "/subject/age", "value": 36,
+      "proof": [ {"side": "left", "sibling": "…"} ] }
+  ],
+  "policy": {
+    "all": [
+      { "path": "/subject/age", "op": "gte", "value": 18 },
+      { "any": [
+        { "path": "/subject/name", "op": "eq", "value": "Ada" },
+        { "path": "/subject/id", "op": "eq", "value": "u-123" }
+      ] }
+    ]
+  }
+}
+```
+
+成功（`200`；`/subject/name` 与 `/subject/id` 未披露记 `unknown`，`any` 组因而
+`unknown`，`all` 组无 `fail` 故总判定 `unknown`）：
+
+```json
+{
+  "valid": true,
+  "root": "9f0c…",
+  "result": "unknown",
+  "conditions": [
+    {"loc": "policy.all[0]", "path": "/subject/age", "op": "gte", "value": 18, "result": "pass"},
+    {"loc": "policy.all[1].any[0]", "path": "/subject/name", "op": "eq", "value": "Ada", "result": "unknown"},
+    {"loc": "policy.all[1].any[1]", "path": "/subject/id", "op": "eq", "value": "u-123", "result": "unknown"}
+  ]
+}
+```
+
+`eq` 按规范 JSON 字节比较（`1` ≠ `1.0`）；`gte` 阈值必须是非布尔有限数字，披露值
+非数字判 `fail`；未披露路径记 `unknown`。空组与非法条件返回 `400`，`loc` 定位到
+`policy` 内出错位置（如 `policy.all[1].any`、`policy.value`）。完整语义见上文
+[§12](#12-策略门控评估post-gateevaluate)。
+
 ### `POST /merge` — 三路合并两份分支编辑
 
 请求（`base` 是共同祖先，`left`/`right` 是两路编辑）：
@@ -888,6 +986,7 @@ curl -s localhost:8000/patch/undo -H 'content-type: application/json' -d '{
 ### 其他
 
 - `GET /healthz` → `{"status":"ok"}`
+- `POST /gate/evaluate` → 按 /verify 规则验证披露后，对 all/any 策略树做三值逻辑门控评估，返回 pass/fail/unknown 与每条件结果
 - `POST /diff` → 叶级 added/removed/changed 变更报告
 - `POST /patch` → 顺序执行 RFC 6902 add/remove/replace 补丁，返回 patched 文档与 changedPaths
 - `POST /patch/undo` → 同 /patch 请求，额外返回反序的 undoOperations，回放到 /patch 即还原原文档
@@ -979,6 +1078,19 @@ curl -s localhost:8000/merge -H 'content-type: application/json' -d '{
 }'
 # 无冲突 => {"merged": {...}}；把两侧对同一路径改成不同值（或一侧删除一侧修改）
 # 则返回 {"conflicts": [...]}，按 RFC 6901 路径排序，每条含 base/left/right 的 present+value
+
+# 9) 策略门控：/verify 请求 + policy，先验证证明再做三值逻辑判定
+curl -s localhost:8000/commit -H 'content-type: application/json' -d '{
+  "document": {"subject": {"name": "Ada", "age": 36}, "emails": ["a@x", "b@y"]},
+  "reveal": ["/subject/age"]
+}' > /tmp/gate.json
+jq '{root, leaves, policy: {all: [
+  {"path": "/subject/age", "op": "gte", "value": 18},
+  {"path": "/subject/name", "op": "eq", "value": "Ada"}
+]}}' /tmp/gate.json \
+  | curl -s localhost:8000/gate/evaluate -H 'content-type: application/json' -d @-
+# => {"valid": true, "result": "unknown", ...}
+#    /subject/age 已披露且 36>=18 为 pass；/subject/name 未披露记 unknown
 ```
 
 ## 本地开发与测试（不使用 Docker）
@@ -993,7 +1105,8 @@ python3 -m uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由：/commit、/verify、/diff、/patch、/redact、/shape、/merge、错误处理
+  main.py        # FastAPI 路由：/commit、/verify、/gate/evaluate、/diff、/patch、/redact、/shape、/merge、错误处理
+  gate.py        # 策略门控：all/any 组与 {path,op,value} 叶条件的校验与三值逻辑评估
   diff.py        # 叶级路径对齐、规范值指纹与 added/removed/changed
   merge.py       # base/left/right 三路合并：对象成员递归、数组原子、规范相等、RFC 6901 排序冲突
   patch.py       # RFC 6902 add/remove/replace 引擎（有序执行、整体校验、changedPaths、逆操作记录）
@@ -1004,7 +1117,7 @@ app/
   canonical.py   # 规范 JSON 序列化
   jsonio.py      # 严格 JSON 解析（拒绝重复键、错误定位）
   validation.py  # 提交值校验（非有限数、非 JSON 类型等）
-  openapi.py     # 两种证明格式与 /diff、/patch、/patch/undo 的 OpenAPI 模型与文档合并
+  openapi.py     # 两种证明格式与 /gate/evaluate、/diff、/patch、/patch/undo 等的 OpenAPI 模型与文档合并
   errors.py      # 带 code/loc 的 API 错误类型
 tests/           # 哈希/树单元测试 + API 端到端（含全部篡改、去重、结构错误与补丁场景）
 Dockerfile

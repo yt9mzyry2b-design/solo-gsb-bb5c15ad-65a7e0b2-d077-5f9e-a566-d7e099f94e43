@@ -427,6 +427,121 @@ class CompactVerifyResponse(StandardVerifyResponse):
 
 
 # ---------------------------------------------------------------------------
+# Policy gate evaluation
+# ---------------------------------------------------------------------------
+
+
+class GatePolicyNode(BaseModel):
+    """One policy node: an `all`/`any` group or a `{path, op, value}`
+    condition.  A node carries exactly one combinator, or the condition
+    fields — never both."""
+
+    all: Optional[List["GatePolicyNode"]] = Field(
+        None,
+        description=(
+            "Group combinator over a non-empty array of policy nodes: the "
+            "group fails as soon as one child fails, is unknown when any "
+            "child is unknown, and passes only when every child passes."
+        ),
+    )
+    any: Optional[List["GatePolicyNode"]] = Field(
+        None,
+        description=(
+            "Group combinator over a non-empty array of policy nodes: the "
+            "group passes as soon as one child passes, is unknown when any "
+            "child is unknown, and fails only when every child fails."
+        ),
+    )
+    path: Optional[str] = Field(
+        None,
+        description=(
+            "Condition field: the exact RFC 6901 leaf path read from the "
+            "verified disclosures; an undisclosed path evaluates to "
+            "'unknown'."
+        ),
+    )
+    op: Optional[Literal["eq", "gte"]] = Field(
+        None,
+        description=(
+            "Condition field: 'eq' compares the disclosed value with "
+            "`value` by canonical JSON bytes (1 and 1.0 differ, as do true "
+            "and 1); 'gte' compares numerically and requires `value` to be "
+            "a non-boolean finite number — a disclosed value that is not a "
+            "non-boolean number evaluates to 'fail'."
+        ),
+    )
+    value: Optional[Any] = Field(
+        None,
+        description="Condition field: the comparison constant.",
+    )
+
+
+class StandardGateEvaluateRequest(BaseModel):
+    root: str = HexHash
+    leaves: List[StandardVerifyLeaf]
+    policy: GatePolicyNode = Field(
+        ...,
+        description=(
+            "Policy tree of nested all/any groups down to leaf conditions "
+            "{path, op, value}. Empty groups and malformed conditions are "
+            "rejected with a loc inside `policy`."
+        ),
+    )
+
+
+class CompactGateEvaluateRequest(BaseModel):
+    root: str = HexHash
+    leafCount: int = Field(..., ge=1)
+    leaves: List[CompactCommitLeaf]
+    proofNodes: List[ProofNodeModel]
+    policy: GatePolicyNode = Field(
+        ...,
+        description=(
+            "Policy tree of nested all/any groups down to leaf conditions "
+            "{path, op, value}. Empty groups and malformed conditions are "
+            "rejected with a loc inside `policy`."
+        ),
+    )
+
+
+class GateConditionResult(BaseModel):
+    loc: str = Field(
+        ...,
+        description=(
+            "Location of the condition inside the submitted policy tree, "
+            "e.g. policy.all[1].any[0]."
+        ),
+    )
+    path: str = Field(..., description="The condition's RFC 6901 leaf path.")
+    op: Literal["eq", "gte"]
+    value: Any = Field(..., description="The condition's comparison constant.")
+    result: Literal["pass", "fail", "unknown"] = Field(
+        ...,
+        description=(
+            "The condition outcome: 'unknown' when the path was not "
+            "disclosed; otherwise the comparison result."
+        ),
+    )
+
+
+class GateEvaluateResponse(BaseModel):
+    valid: bool = True
+    root: str = HexHash
+    proofMode: Optional[Literal["compact"]] = None
+    result: Literal["pass", "fail", "unknown"] = Field(
+        ...,
+        description=(
+            "Overall gate verdict folded from the policy tree with "
+            "three-valued logic."
+        ),
+    )
+    conditions: List[GateConditionResult] = Field(
+        ...,
+        description="One entry per condition, in policy traversal order.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Three-way document merge
 # ---------------------------------------------------------------------------
 
@@ -562,6 +677,9 @@ def install_openapi(app: FastAPI) -> None:
                 CompactVerifyRequest,
                 StandardVerifyResponse,
                 CompactVerifyResponse,
+                StandardGateEvaluateRequest,
+                CompactGateEvaluateRequest,
+                GateEvaluateResponse,
                 DiffRequest,
                 DiffResponse,
                 PatchOperation,
@@ -713,6 +831,92 @@ def install_openapi(app: FastAPI) -> None:
                         "description": "All disclosures rebuild the committed "
                         "root",
                         **_json_content(verify_response_schema),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        generated["paths"]["/gate/evaluate"] = {
+            "post": {
+                "summary": "Verify disclosures and evaluate a policy gate",
+                "description": (
+                    "Runs the exact /verify verification first — the proof "
+                    "format (standard per-leaf proofs or the compact "
+                    "leafCount/proofNodes shape) is auto-detected and every "
+                    "verification failure returns the /verify error "
+                    "unchanged. The `policy` tree of nested `all`/`any` "
+                    "groups and `{path, op, value}` conditions is then "
+                    "evaluated over the verified leaf values only: `eq` "
+                    "compares canonical JSON bytes, `gte` requires a "
+                    "non-boolean finite number threshold and fails on "
+                    "non-numeric disclosed values, and an undisclosed path "
+                    "is `unknown`. Groups fold with three-valued logic "
+                    "(`all` fails fast, `any` passes fast); the response "
+                    "carries the overall pass/fail/unknown verdict plus one "
+                    "result per condition. Empty groups and malformed "
+                    "conditions are rejected with a loc inside `policy`."
+                ),
+                "operationId": "gateEvaluate",
+                "requestBody": _json_content(
+                    {
+                        "oneOf": [
+                            _ref("StandardGateEvaluateRequest"),
+                            _ref("CompactGateEvaluateRequest"),
+                        ],
+                        "description": (
+                            "The disclosure part follows the /verify "
+                            "formats (auto-detected); `policy` adds the "
+                            "gate."
+                        ),
+                    },
+                    example={
+                        "root": "9f0c" + "00" * 30,
+                        "leaves": [
+                            {
+                                "path": "/subject/age",
+                                "value": 36,
+                                "proof": [
+                                    {"side": "left", "sibling": "ab" * 32}
+                                ],
+                            }
+                        ],
+                        "policy": {
+                            "all": [
+                                {"path": "/subject/age", "op": "gte",
+                                 "value": 18},
+                                {"any": [
+                                    {"path": "/subject/name", "op": "eq",
+                                     "value": "Ada"},
+                                    {"path": "/subject/id", "op": "eq",
+                                     "value": "u-123"},
+                                ]},
+                            ]
+                        },
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Proof verified and policy evaluated",
+                        **_json_content(
+                            _ref("GateEvaluateResponse"),
+                            example={
+                                "valid": True,
+                                "root": "9f0c" + "00" * 30,
+                                "result": "unknown",
+                                "conditions": [
+                                    {"loc": "policy.all[0]",
+                                     "path": "/subject/age", "op": "gte",
+                                     "value": 18, "result": "pass"},
+                                    {"loc": "policy.all[1].any[0]",
+                                     "path": "/subject/name", "op": "eq",
+                                     "value": "Ada", "result": "unknown"},
+                                    {"loc": "policy.all[1].any[1]",
+                                     "path": "/subject/id", "op": "eq",
+                                     "value": "u-123", "result": "unknown"},
+                                ],
+                            },
+                        ),
                     },
                     **error_responses,
                 },
