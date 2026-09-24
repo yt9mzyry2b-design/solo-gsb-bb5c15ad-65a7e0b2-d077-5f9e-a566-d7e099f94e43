@@ -11,7 +11,7 @@ metadata for the health/index routes.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -497,6 +497,126 @@ class MergeConflictResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Policy gate (/gate/evaluate)
+# ---------------------------------------------------------------------------
+
+
+class GateConditionModel(BaseModel):
+    path: str = Field(
+        ...,
+        description=(
+            "Exact RFC 6901 pointer of the leaf fact to read. Only leaf "
+            "paths present in the (verified) disclosure carry a value; any "
+            "other path — including a path not disclosed — is 'unknown'."
+        ),
+    )
+    op: Literal["eq", "gte"] = Field(
+        ...,
+        description=(
+            "`eq` compares canonical JSON bytes (so 1 and 1.0 differ); "
+            "`gte` requires a finite, non-boolean numeric threshold and is "
+            "false when the disclosed value is not a number."
+        ),
+    )
+    value: Any = Field(
+        ...,
+        description=(
+            "Comparison threshold — any JSON value for `eq`; only a finite "
+            "number (never a boolean) for `gte`."
+        ),
+    )
+
+
+class PolicyAllGroupModel(BaseModel):
+    all_: List["PolicyNodeModel"] = Field(
+        ...,
+        alias="all",
+        description="Non-empty list of policy nodes; false dominates.",
+    )
+    model_config = {"populate_by_name": True}
+
+
+class PolicyAnyGroupModel(BaseModel):
+    any_: List["PolicyNodeModel"] = Field(
+        ...,
+        alias="any",
+        description="Non-empty list of policy nodes; true dominates.",
+    )
+    model_config = {"populate_by_name": True}
+
+
+PolicyNodeModel = Annotated[
+    Union[PolicyAllGroupModel, PolicyAnyGroupModel, GateConditionModel],
+    Field(
+        description=(
+            "A policy node is either a group {'all': [...]} / "
+            "{'any': [...]} with a non-empty children array, or a leaf "
+            "condition {'path', 'op', 'value'}. Empty groups, mixed "
+            "all/any keys and unknown fields are rejected with the loc "
+            "pointing inside `policy`."
+        )
+    ),
+]
+PolicyAllGroupModel.model_rebuild()
+PolicyAnyGroupModel.model_rebuild()
+
+
+class StandardGateRequest(BaseModel):
+    root: str = HexHash
+    leaves: List[StandardVerifyLeaf] = Field(
+        ..., description="Standard per-leaf disclosures, as for /verify."
+    )
+    policy: PolicyNodeModel = Field(
+        ...,
+        description="Nested all/any policy tree evaluated after the proof "
+        "has been verified.",
+    )
+
+
+class CompactGateRequest(CompactVerifyRequest):
+    policy: PolicyNodeModel = Field(
+        ...,
+        description="Nested all/any policy tree evaluated after the compact "
+        "proof has been verified.",
+    )
+
+
+class GateConditionResult(BaseModel):
+    path: str = Field(..., description="RFC 6901 pointer of the condition.")
+    op: Literal["eq", "gte"] = Field(
+        ..., description="Comparison operator carried by the condition."
+    )
+    result: Literal["pass", "fail", "unknown"] = Field(
+        ...,
+        description=(
+            "pass/fail when the leaf was disclosed and the comparison ran; "
+            "'unknown' when the condition's path is not among the verified "
+            "disclosed leaves."
+        ),
+    )
+
+
+class GateEvaluateResponse(BaseModel):
+    result: Literal["pass", "fail", "unknown"] = Field(
+        ...,
+        description=(
+            "Overall three-valued verdict: a `fail` child dominates an "
+            "'all' group and a `pass` child dominates an 'any' group; "
+            "otherwise 'unknown' propagates upward."
+        ),
+    )
+    root: str = HexHash
+    proofMode: Literal["standard", "compact"]
+    conditions: List[GateConditionResult] = Field(
+        ...,
+        description=(
+            "Every leaf condition in depth-first policy order with its own "
+            "pass/fail/unknown result."
+        ),
+    )
+
+
 class ErrorDetail(BaseModel):
     code: str
     message: str
@@ -580,6 +700,13 @@ def install_openapi(app: FastAPI) -> None:
                 MergeConflict,
                 MergeSuccessResponse,
                 MergeConflictResponse,
+                GateConditionModel,
+                PolicyAllGroupModel,
+                PolicyAnyGroupModel,
+                StandardGateRequest,
+                CompactGateRequest,
+                GateConditionResult,
+                GateEvaluateResponse,
                 ErrorResponse,
             )
         )
@@ -713,6 +840,109 @@ def install_openapi(app: FastAPI) -> None:
                         "description": "All disclosures rebuild the committed "
                         "root",
                         **_json_content(verify_response_schema),
+                    },
+                    **error_responses,
+                },
+            }
+        }
+
+        gate_request_schema = {
+            "oneOf": [
+                _ref("StandardGateRequest"),
+                _ref("CompactGateRequest"),
+            ],
+            "description": (
+                "The disclosure part uses the same shape as /verify and the "
+                "format is detected the same way (`proofNodes`/`leafCount` "
+                "means compact). A nested `policy` is evaluated only after "
+                "the whole disclosure has been verified."
+            ),
+        }
+
+        generated["paths"]["/gate/evaluate"] = {
+            "post": {
+                "summary": "Verify a disclosure, then evaluate a policy "
+                           "against its proven leaves",
+                "description": (
+                    "First verifies the complete disclosure — standard "
+                    "per-leaf proofs or the compact multi-leaf format — "
+                    "using exactly the /verify rules: an invalid proof "
+                    "fails with the identical error code and loc (400 "
+                    "BAD_PROOF for structural faults, 422 ROOT_MISMATCH "
+                    "when the rebuilt root differs) and no policy is read. "
+                    "Only verified leaf values feed the evaluation. The "
+                    "`policy` is a tree of nested `all`/`any` groups "
+                    "(non-empty, mutually exclusive) and leaf conditions "
+                    "`{path, op, value}` with `op` `eq` or `gte`; every "
+                    "condition path is an exact RFC 6901 leaf pointer. "
+                    "`eq` compares canonical JSON bytes (1 ≠ 1.0); `gte` "
+                    "accepts only a finite non-boolean numeric threshold "
+                    "and is false (never an error) when the disclosed "
+                    "value is non-numeric. An undisclosed condition path "
+                    "is `unknown`. Groups use three-valued logic: in "
+                    "`all` a `fail` dominates and in `any` a `pass` "
+                    "dominates, otherwise `unknown` propagates. Empty "
+                    "groups and illegal conditions are 400 errors with "
+                    "`loc` pointing inside `policy`. The response gives "
+                    "the overall pass/fail/unknown plus each condition's "
+                    "own result in depth-first policy order."
+                ),
+                "operationId": "gateEvaluate",
+                "requestBody": _json_content(
+                    gate_request_schema,
+                    example={
+                        "root": "9f0c000000000000000000000000000000000000000000000000000000000000",
+                        "leafCount": 8,
+                        "leaves": [
+                            {"path": "/subject/age", "index": 5, "value": 36},
+                            {"path": "/subject/name", "index": 6,
+                             "value": "Ada"},
+                        ],
+                        "proofNodes": [
+                            {"level": 0, "index": 4, "hash": "ab" * 32},
+                            {"level": 1, "index": 3, "hash": "cd" * 32},
+                            {"level": 2, "index": 0, "hash": "ef" * 32},
+                        ],
+                        "policy": {
+                            "all": [
+                                {"path": "/subject/name", "op": "eq",
+                                 "value": "Ada"},
+                                {"any": [
+                                    {"path": "/subject/age", "op": "gte",
+                                     "value": 18},
+                                    {"path": "/subject/age", "op": "gte",
+                                     "value": 65},
+                                ]},
+                                {"path": "/subject/role", "op": "eq",
+                                 "value": "admin"},
+                            ]
+                        },
+                    },
+                ),
+                "responses": {
+                    "200": {
+                        "description": (
+                            "Disclosure verified; the policy evaluated "
+                            "against proven leaf values."
+                        ),
+                        **_json_content(
+                            _ref("GateEvaluateResponse"),
+                            example={
+                                "result": "unknown",
+                                "root": "9f0c000000000000000000000000000000000000000000000000000000000000",
+                                "proofMode": "compact",
+                                "conditions": [
+                                    {"path": "/subject/name", "op": "eq",
+                                     "result": "pass"},
+                                    {"path": "/subject/age", "op": "gte",
+                                     "result": "pass"},
+                                    {"path": "/subject/age", "op": "gte",
+                                     "result": "fail"},
+                                    {"path": "/subject/role", "op": "eq",
+                                     "result": "unknown"},
+                                ],
+                            },
+                        ),
                     },
                     **error_responses,
                 },

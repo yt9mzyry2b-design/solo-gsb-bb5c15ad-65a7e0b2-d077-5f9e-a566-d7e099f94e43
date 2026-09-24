@@ -10,6 +10,11 @@ POST /commit   submit a nested JSON document plus the RFC 6901 paths that
 POST /verify   check disclosures against a previously committed root without
                ever seeing the original document; both proof formats are
                detected automatically.
+POST /gate/evaluate
+               verify a /verify-shaped disclosure and then evaluate a policy
+               of nested all/any groups and {path,op,value} leaf conditions
+               using only verified leaf values; the result is pass/fail/
+               unknown under three-valued logic.
 POST /diff     compare two documents at their RFC 6901 leaf paths and report
                added, removed and changed canonical values.
 POST /patch    apply an ordered list of RFC 6902 operations (add, remove,
@@ -48,6 +53,7 @@ from fastapi.responses import JSONResponse
 from . import pointers
 from .canonical import CanonicalError
 from .diff import diff_documents
+from .gate import evaluate_policy, validate_policy
 from .merge import merge_documents
 from .patch import apply_patch
 from .redact import redact_document
@@ -98,7 +104,7 @@ _HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 app = FastAPI(
     title="Selective JSON Disclosure",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Commit a nested JSON document to a reproducible Merkle root and "
         "disclose individual RFC 6901 leaf facts with inclusion proofs.\n\n"
@@ -967,6 +973,12 @@ def _verify_compact(
 
 @app.post("/verify")
 async def verify(request: Request) -> Dict[str, Any]:
+    body, expected_root = await _verify_request(request)
+    return _verify_body(body, expected_root)
+
+
+async def _verify_request(request: Request) -> Tuple[Dict[str, Any], bytes]:
+    """Read a /verify-shaped body and parse its committed root."""
     body = await _read_json_body(request)
     if not isinstance(body, dict):
         raise ApiError(
@@ -978,7 +990,19 @@ async def verify(request: Request) -> Dict[str, Any]:
     expected_root = _parse_hex32(
         _get_field(body, "root", "root"), "root", "root hash"
     )
+    return body, expected_root
 
+
+def _verify_body(
+    body: Dict[str, Any], expected_root: bytes
+) -> Dict[str, Any]:
+    """Verify a /verify-shaped body.
+
+    Shared verbatim by ``/verify`` and ``/gate/evaluate``: the gate first
+    proves the disclosure with exactly these rules, so an invalid proof
+    fails with the same error code and ``loc`` as on ``/verify`` before any
+    policy is read. Returns the documented success response.
+    """
     # Auto-detect the proof format: the compact shape carries a shared
     # "proofNodes" array (plus per-leaf "index" and a top-level "leafCount");
     # the legacy shape carries per-leaf "proof" arrays.
@@ -992,6 +1016,14 @@ async def verify(request: Request) -> Dict[str, Any]:
             "leaves": verified,
         }
 
+    verified = _verify_standard(body, expected_root)
+    return {"valid": True, "root": expected_root.hex(), "leaves": verified}
+
+
+def _verify_standard(
+    body: Dict[str, Any], expected_root: bytes
+) -> List[Dict[str, Any]]:
+    """Verify the legacy per-leaf ``{path, value, proof}`` disclosure."""
     raw_leaves = _get_field(body, "leaves", "leaves")
     if not isinstance(raw_leaves, list):
         raise ApiError(
@@ -1077,7 +1109,36 @@ async def verify(request: Request) -> Dict[str, Any]:
         verified.append({"path": path, "value": value})
 
     verified.sort(key=lambda item: item["path"])
-    return {"valid": True, "root": expected_root.hex(), "leaves": verified}
+    return verified
+
+
+# ---------------------------------------------------------------------------
+# POST /gate/evaluate
+# ---------------------------------------------------------------------------
+
+
+@app.post("/gate/evaluate")
+async def gate_evaluate(request: Request) -> Dict[str, Any]:
+    # The disclosure is proved first using the exact /verify rules; an
+    # invalid proof therefore reports the same error/code/loc as /verify and
+    # no policy field is examined until the proof holds.
+    body, expected_root = await _verify_request(request)
+    verdict = _verify_body(body, expected_root)
+
+    policy = _get_field(body, "policy", "policy")
+    validate_policy(policy, "policy")
+
+    # Values are read exclusively from the verified disclosure — never from
+    # raw, unauthenticated request fields.
+    disclosed = {leaf["path"]: leaf["value"] for leaf in verdict["leaves"]}
+    overall, conditions = evaluate_policy(policy, disclosed)
+
+    return {
+        "result": overall,
+        "root": expected_root.hex(),
+        "proofMode": verdict.get("proofMode", "standard"),
+        "conditions": conditions,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1094,10 +1155,11 @@ async def healthz() -> Dict[str, str]:
 async def index() -> Dict[str, Any]:
     return {
         "service": "selective-json-disclosure",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "endpoints": {
             "commit": "POST /commit",
             "verify": "POST /verify",
+            "gateEvaluate": "POST /gate/evaluate",
             "diff": "POST /diff",
             "patch": "POST /patch",
             "patchUndo": "POST /patch/undo",
